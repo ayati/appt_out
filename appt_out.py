@@ -407,19 +407,18 @@ class ADBFile:
             # マジック
             f.write(ADB_MAGIC)
 
-            # DBヘッダ (iNumRecordsを更新)
+            # DBHDR: まず書き込み位置を記録してから書き出す
+            # (修正) DBHDR も seek_info に追加する必要がある
+            dbhdr_pos = f.tell()  # = 4 (magic直後)
             dbhdr = bytearray(self.dbhdr_bytes)
-            # iNumRecords = offset 12 (相対: RHDR6 + iReleaseNum2 + cFileType1 + cFileStatus1 = 10... 再確認)
-            # DBHDR layout: cType(1)+cStatus(1)+iLength(2)+iRecord(2)=6 + iReleaseNum(2)+cFileType(1)+cFileStatus(1)
-            #               +iCurrViewPt(2)+iNumRecords(2)+iLookUpSeek(4)+cYear(1)+cMonth(1)+cDay(1)+iMinute(2)
-            #               +iViewPtHash1(1)+iViewPtHash2(1) = 25
-            # iNumRecords offset from start of DBHDR = 6+2+1+1+2 = 12
-            # Note: will be updated after all records are written
             f.write(bytes(dbhdr))
 
-            # SeekInfo: (iSize, iRecord, seek_pos) per record, by type
+            # SeekInfo: (cType, iRecord, iLength, file_offset) per record
+            # iLength = RHDR_SIZE + payload_size (C言語版と同一定義)
             seek_info: List[Tuple[int, int, int, int]] = []
-            # (cType, iRecord, size_without_header=iLength, file_offset)
+
+            # (修正) DBHDR を seek_info に追加
+            seek_info.append((TYPE_DBHEADER, 0, DBHDR_SIZE, dbhdr_pos))
 
             def write_record(cType, cStatus, iRecord, payload):
                 pos = f.tell()
@@ -429,7 +428,7 @@ class ADBFile:
                 f.write(payload)
                 seek_info.append((cType, iRecord, iLength, pos))
 
-            # ヘッダレコード群 (CardDef, FieldDef等) をコピー
+            # ヘッダレコード群 (FieldDef等) をコピー
             for cType, cStatus, iRecord, payload in self.header_records:
                 write_record(cType, cStatus, iRecord, payload)
 
@@ -453,17 +452,17 @@ class ADBFile:
             seek_info.append((TYPE_VIEWPTTABLE, 0, 6, vpt_pos))
 
             # LookupTable
+            # (修正1) iLength = N*8+6 のみ。type-count テーブル(64バイト)は含めない
+            # (修正2) LUT 自身は seek_info に追加しない（C言語版と同様）
             lut_pos = f.tell()
-            total_records = len(seek_info) + 1  # +1 for LUT itself
-            lut_size = total_records * 8 + 6 + 64  # 8バイト/エントリ + RHDR + 32*2バイトのtype別カウント
-
-            lut_hdr = struct.pack('<BBHh', TYPE_LOOKUPTABLE, 2,
-                                  len(seek_info) * 8 + 6 + 64, 0)
+            n_index = len(seek_info)  # LUT を除いた全レコード数
+            lut_iLength = n_index * 8 + RHDR_SIZE
+            lut_hdr = struct.pack('<BBHh', TYPE_LOOKUPTABLE, 2, lut_iLength, 0)
             f.write(lut_hdr)
-            seek_info.append((TYPE_LOOKUPTABLE, 0, len(seek_info)*8 + 6 + 64, lut_pos))
 
-            # インデックスエントリを書く
-            for cType, iRecord, iLength, offset in seek_info:
+            # (修正3) インデックスエントリは cType 順にソートして書く
+            seek_info_sorted = sorted(seek_info, key=lambda x: x[0])
+            for cType, iRecord, iLength, offset in seek_info_sorted:
                 entry = bytearray(8)
                 entry[0] = iLength & 0xFF
                 entry[1] = (iLength >> 8) & 0xFF
@@ -475,18 +474,9 @@ class ADBFile:
                 entry[7] = (offset >> 16) & 0xFF
                 f.write(bytes(entry))
 
-            # 32種類のtype別開始レコード番号テーブル
-            type_counts = [0] * 32
-            running = 0
-            for cType, _, _, _ in seek_info:
-                if 0 <= cType < 32:
-                    type_counts[cType] += 1  # ここは累積カウントではなく開始インデックス
-            # 実際には累積合計を書く
-            cumsum = 0
-            type_starts = [0] * 32
-            # seek_infoをtype別に集計
+            # 32種類の type別開始インデックステーブル (cType 順ソート後の累積開始位置)
             counts_by_type = [0] * 32
-            for cType, _, _, _ in seek_info:
+            for cType, _, _, _ in seek_info_sorted:
                 if 0 <= cType < 32:
                     counts_by_type[cType] += 1
             running = 0
@@ -494,12 +484,10 @@ class ADBFile:
                 f.write(struct.pack('<H', running))
                 running += counts_by_type[i]
 
-            # DBヘッダのiNumRecordsとlookUpSeekを更新
-            total = data_num + note_num
-            f.seek(4 + 12)  # magic(4) + DBHDR先頭からiNumRecordsまで
-            # DBHDR内オフセット12 = cType(1)+cStatus(1)+iLength(2)+iRecord(2)+iReleaseNum(2)+cFileType(1)+cFileStatus(1)+iCurrViewPt(2) = 12
-            f.write(struct.pack('<H', total))
-            # iLookUpSeek (offset 14 in DBHDR)
+            # (修正4) DBHDR の iNumRecords = LUT インデックスの全エントリ数 (= n_index)
+            #         iLookUpSeek = LUT レコードの先頭オフセット (lut_pos)
+            f.seek(4 + 12)  # magic(4) + DBHDR先頭からiNumRecordsまでのオフセット12
+            f.write(struct.pack('<H', n_index))
             f.write(struct.pack('<I', lut_pos))
 
 
@@ -508,9 +496,9 @@ class ADBFile:
 # ---------------------------------------------------------------------------
 
 def _encode_time(minutes: Optional[int]) -> Tuple[int, int]:
-    """分 → (cPri1, cPri2). NONE時は (0xFF, 0xFF)"""
+    """分 → (cPri1, cPri2). NONE時は (0x00, 0x00)"""
     if minutes is None:
-        return (0xFF, 0xFF)
+        return (0x00, 0x00)
     return (minutes & 0xFF, (minutes >> 8) & 0xFF)
 
 
