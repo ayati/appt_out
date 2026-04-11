@@ -403,6 +403,50 @@ class ADBFile:
         if new_appointments:
             out_appts.extend(new_appointments)
 
+        # HP 200LX は同一日付のレコードを iPrev/iNextRecNum の連結リストで管理する。
+        # apptout.exe と同様に日付順・時刻順にソートしてから書き出す。
+        # 全日イベント (start_time=None) は同日の先頭に置く。
+        def _sort_key(a: Appointment):
+            return (
+                a.start_year, a.start_month, a.start_day,
+                0 if a.start_time is None else 1,
+                a.start_time if a.start_time is not None else 0,
+            )
+        out_appts.sort(key=_sort_key)
+
+        # ノート番号を事前割り当て (ソート後順序)
+        note_assignments: List[int] = []
+        note_num = 0
+        for appt in out_appts:
+            if appt.note:
+                note_assignments.append(note_num)
+                note_num += 1
+            else:
+                note_assignments.append(-1)
+
+        # 同一日付グループ内の iPrev/iNextRecNum を構築
+        # data_num = 0-based index in out_appts (ソート後)
+        prev_recs = [-1] * len(out_appts)
+        next_recs = [-1] * len(out_appts)
+        i = 0
+        while i < len(out_appts):
+            a = out_appts[i]
+            j = i + 1
+            while j < len(out_appts):
+                b = out_appts[j]
+                if (b.start_year, b.start_month, b.start_day) == \
+                   (a.start_year, a.start_month, a.start_day):
+                    j += 1
+                else:
+                    break
+            # i..j-1 が同一日付グループ
+            for k in range(i, j):
+                if k > i:
+                    prev_recs[k] = k - 1
+                if k < j - 1:
+                    next_recs[k] = k + 1
+            i = j
+
         with open(path, 'wb') as f:
             # マジック
             f.write(ADB_MAGIC)
@@ -432,18 +476,17 @@ class ADBFile:
             for cType, cStatus, iRecord, payload in self.header_records:
                 write_record(cType, cStatus, iRecord, payload)
 
-            # アポイントメントデータを書き出す
-            note_num = 0
-            data_num = 0
-            for appt in out_appts:
-                payload, note_payload = _appointment_to_data(appt, note_num if appt.note else -1)
-
+            # アポイントメントデータを書き出す (日付・時刻ソート済み)
+            for data_num, appt in enumerate(out_appts):
+                n_rec = note_assignments[data_num]
+                payload, note_payload = _appointment_to_data(
+                    appt, n_rec,
+                    prev_rec=prev_recs[data_num],
+                    next_rec=next_recs[data_num],
+                )
                 write_record(TYPE_DATA, 2, data_num, payload)
-                data_num += 1
-
                 if appt.note:
-                    write_record(TYPE_NOTE, 2, note_num, note_payload)
-                    note_num += 1
+                    write_record(TYPE_NOTE, 2, n_rec, note_payload)
 
             # ViewPointTable (空)
             vpt_pos = f.tell()
@@ -502,7 +545,8 @@ def _encode_time(minutes: Optional[int]) -> Tuple[int, int]:
     return (minutes & 0xFF, (minutes >> 8) & 0xFF)
 
 
-def _appointment_to_data(appt: Appointment, note_rec_num: int) -> Tuple[bytes, bytes]:
+def _appointment_to_data(appt: Appointment, note_rec_num: int,
+                         prev_rec: int = -1, next_rec: int = -1) -> Tuple[bytes, bytes]:
     """
     AppointmentをTYPE_DATAのペイロードとTYPE_NOTEのペイロードに変換。
     Returns (data_payload, note_payload)
@@ -545,8 +589,8 @@ def _appointment_to_data(appt: Appointment, note_rec_num: int) -> Tuple[bytes, b
     struct.pack_into('<H', nra, 4, os_location)            # iOsLocation
     struct.pack_into('<H', nra, 6, os_repeat)              # iOsRepeat
     struct.pack_into('<h', nra, 8, note_rec_num)           # iNoteRecNum
-    struct.pack_into('<h', nra, 10, -1)                    # iPrevRecNum
-    struct.pack_into('<h', nra, 12, -1)                    # iNextRecNum
+    struct.pack_into('<h', nra, 10, prev_rec)               # iPrevRecNum
+    struct.pack_into('<h', nra, 12, next_rec)               # iNextRecNum
     nra[14] = appt.flags                                   # cFlags
 
     nra[15] = appt.start_year & 0xFF
