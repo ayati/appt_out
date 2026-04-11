@@ -1167,6 +1167,39 @@ def _vevent_to_appointment(props: Dict[str, str],
 
 
 # ---------------------------------------------------------------------------
+# 重複チェック
+# ---------------------------------------------------------------------------
+
+def _appt_key(appt: Appointment) -> tuple:
+    """重複判定キー: (description, date, start_time)"""
+    return (
+        appt.description.strip(),
+        appt.start_year,
+        appt.start_month,
+        appt.start_day,
+        appt.start_time,
+    )
+
+
+def deduplicate(existing: List[Appointment],
+                new_appts: List[Appointment]) -> Tuple[List[Appointment], int]:
+    """
+    existing に既に存在するものを new_appts から除外して返す。
+    一致判定: (description, 開始日, 開始時刻)
+    戻り値: (フィルタ後リスト, スキップ件数)
+    """
+    existing_keys = {_appt_key(a) for a in existing}
+    filtered = []
+    skipped = 0
+    for a in new_appts:
+        if _appt_key(a) in existing_keys:
+            skipped += 1
+        else:
+            filtered.append(a)
+    return filtered, skipped
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1209,6 +1242,8 @@ def main():
 
     parser.add_argument('-m', dest='merge', action='store_true',
                         help='新規作成モード (既存データをコピーしない)')
+    parser.add_argument('--dedup', dest='dedup', action='store_true',
+                        help='重複スキップモード: 既存ADBと一致する予定はインポートしない')
     parser.add_argument('-n', dest='note_mode', nargs='?', const='2', default='2',
                         metavar='N', help='NOTEの改行処理 0=そのまま 1=スペース 2=\\n(デフォルト)')
     parser.add_argument('-r', dest='alarm', nargs='?', const='7', default='7',
@@ -1280,6 +1315,16 @@ def main():
             sys.exit(1)
         if silent < 2:
             print(f"  {len(new_appts)} records imported.", file=sys.stderr)
+
+        # 重複スキップ
+        if args.dedup and not args.merge:
+            new_appts, skipped = deduplicate(adb.appointments, new_appts)
+            if silent < 2:
+                print(f"  {skipped} records skipped (duplicate).", file=sys.stderr)
+                print(f"  {len(new_appts)} records will be added.", file=sys.stderr)
+        elif args.dedup and args.merge:
+            if silent < 2:
+                print("  Warning: --dedup is ignored with -m (new mode).", file=sys.stderr)
 
     # ADB書き出し
     if args.output_adb:
