@@ -35,6 +35,7 @@ TYPE_VIEWPTTABLE = 10
 TYPE_DATA        = 11
 TYPE_LINKDEF     = 12
 TYPE_CARDPAGEDEF = 13
+TYPE_USERTYPE14  = 14   # apptout.exe の "UserType14" (日付インデックス + 設定)
 TYPE_LOOKUPTABLE = 31
 
 # cFlags: データ種別
@@ -450,6 +451,48 @@ class ADBFile:
                     next_recs[k] = k + 1
             i = j
 
+        # TYPE_14 レコードを他のヘッダレコードと分離する。
+        # TYPE_14[1] は日付→iRecord のインデックステーブルで、データ書き込み後に
+        # 再構築する必要がある。TYPE_14[0] はカウントフィールドを更新する。
+        non_type14_headers = [(cType, cStatus, iRecord, payload)
+                              for (cType, cStatus, iRecord, payload) in self.header_records
+                              if cType != TYPE_USERTYPE14]
+        type14_map = {iRecord: (cStatus, payload)
+                      for (cType, cStatus, iRecord, payload) in self.header_records
+                      if cType == TYPE_USERTYPE14}
+
+        # TYPE_14[1]: 日付→iRecord インデックステーブルを構築
+        # 各ユニーク日付の先頭レコード (iPrev=-1) について 5 バイトエントリを作成:
+        #   [cYear, cMonth, cDay, iRec_lo, iRec_hi]
+        # エントリは日付順（= data_num 順）に並べ、末尾に終端 5a0000ffff を付ける。
+        date_index_entries: List[bytes] = []
+        for data_num, appt in enumerate(out_appts):
+            if prev_recs[data_num] == -1 and appt.has_date:
+                date_index_entries.append(bytes([
+                    appt.start_year  & 0xFF,
+                    appt.start_month & 0xFF,
+                    appt.start_day   & 0xFF,
+                    data_num & 0xFF,
+                    (data_num >> 8) & 0xFF,
+                ]))
+        type14_1_payload = b''.join(date_index_entries) + bytes([0x5A, 0x00, 0x00, 0xFF, 0xFF])
+        n_unique_dates = len(date_index_entries)
+
+        # TYPE_14[0]: bytes[19:21] (LE short) にユニーク日付数を書き込む
+        if 0 in type14_map:
+            cStatus_t14_0, payload_t14_0 = type14_map[0]
+            pa = bytearray(payload_t14_0)
+            if len(pa) >= 21:
+                struct.pack_into('<H', pa, 19, n_unique_dates)
+            type14_0_payload = bytes(pa)
+        else:
+            cStatus_t14_0, type14_0_payload = 2, b''
+
+        if 1 in type14_map:
+            cStatus_t14_1, _ = type14_map[1]
+        else:
+            cStatus_t14_1 = 2
+
         with open(path, 'wb') as f:
             # マジック
             f.write(ADB_MAGIC)
@@ -475,8 +518,8 @@ class ADBFile:
                 f.write(payload)
                 seek_info.append((cType, iRecord, iLength, pos))
 
-            # ヘッダレコード群 (FieldDef等) をコピー
-            for cType, cStatus, iRecord, payload in self.header_records:
+            # ヘッダレコード群 (FieldDef等) をコピー (TYPE_14 を除く)
+            for cType, cStatus, iRecord, payload in non_type14_headers:
                 write_record(cType, cStatus, iRecord, payload)
 
             # アポイントメントデータを書き出す (日付・時刻ソート済み)
@@ -490,6 +533,12 @@ class ADBFile:
                 write_record(TYPE_DATA, 2, data_num, payload)
                 if appt.note:
                     write_record(TYPE_NOTE, 2, n_rec, note_payload)
+
+            # TYPE_14 を DATA/NOTE の後ろに書き出す (ok_dos/apptout.exe と同じ順序)
+            # iRecord=0 → 設定レコード、iRecord=1 → 日付インデックステーブル
+            if type14_0_payload:
+                write_record(TYPE_USERTYPE14, cStatus_t14_0, 0, type14_0_payload)
+            write_record(TYPE_USERTYPE14, cStatus_t14_1, 1, type14_1_payload)
 
             # ViewPointTable (空)
             vpt_pos = f.tell()
