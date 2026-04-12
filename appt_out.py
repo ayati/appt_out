@@ -415,8 +415,11 @@ class ADBFile:
         out_appts.sort(key=_sort_key)
 
         # ノート番号を事前割り当て (ソート後順序)
+        # NOTE の iRecord は DATA の iRecord と重複しないよう len(out_appts) 以降から割り当てる。
+        # DATA iRecord は 0..N-1、NOTE iRecord は N.. とすることで
+        # HP 200LX が iNoteRecNum を辿る際に DATA レコードと誤認識しない。
         note_assignments: List[int] = []
-        note_num = 0
+        note_num = len(out_appts)
         for appt in out_appts:
             if appt.note:
                 note_assignments.append(note_num)
