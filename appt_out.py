@@ -1200,10 +1200,9 @@ def _vevent_to_appointment(props: Dict[str, str],
             appt.end_time = dtend.hour * 60 + dtend.minute
         else:
             appt.end_time = None
-        # 連続日数 (終日イベント複数日)
-        if dtstart.date() != dtend.date() and appt.start_time is None:
-            delta = (dtend.date() - dtstart.date()).days
-            appt.consec_days = max(0, delta - 1)
+        # 終日イベントの複数日: HP 200LX は iEndDate!=0 のレコードを誤判定するため
+        # DOS apptout と同様に常に 0 にする。開始日のみの単日イベントとして登録。
+        # appt.consec_days は既定値 0 のままにする。
 
     # RRULE → 繰り返し情報
     rrule = props.get('RRULE', '')
