@@ -4,10 +4,11 @@ appt_out.py - HP 200LX *.adb (Appointment Book) 入出力ツール
 Python3 port of apptout 0.86b by nuisance
 
 Usage:
-  python appt_out.py -x APPT.adb                        # ADB→CSV (stdout)
-  python appt_out.py -x APPT.adb -o OUT.adb             # ADB複製
-  python appt_out.py -x APPT.adb -i IN.csv -o OUT.adb -e  # CSV→ADB追加
-  python appt_out.py -x APPT.adb -i IN.ics -o OUT.adb -e  # ICS→ADB追加
+  python appt_out.py -x APPT.adb                              # ADB→CSV (stdout)
+  python appt_out.py -x APPT.adb -a -b                        # ADB→TSV (タブ区切り)
+  python appt_out.py -x APPT.adb -o OUT.adb                   # ADB複製
+  python appt_out.py -x APPT.adb --ics IN.ics -o OUT.adb      # ICS→ADB (種別自動判定)
+  python appt_out.py -x APPT.adb -i IN.csv -o OUT.adb -a      # CSV→ADB追加
 """
 
 import sys
