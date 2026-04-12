@@ -1079,12 +1079,38 @@ def _rrule_to_repeat(rrule: str, dtstart: Optional[datetime]) -> Tuple[int, Opti
     return repeat_type, ri if repeat_type != REPEAT_NONE else None
 
 
-def import_ics(path: str, kind: str = 'event', alarm: int = 7) -> List[Appointment]:
+def _detect_ics_encoding(path: str) -> str:
+    """
+    ICS ファイルのエンコーディングを推定する。
+    UTF-8 BOM → 'utf-8-sig'
+    strict UTF-8 で読めれば → 'utf-8'
+    失敗すれば → 'cp932' (Shift-JIS)
+    """
+    with open(path, 'rb') as f:
+        bom = f.read(3)
+    if bom == b'\xef\xbb\xbf':
+        return 'utf-8-sig'
+    try:
+        with open(path, 'r', encoding='utf-8', errors='strict') as f:
+            f.read()
+        return 'utf-8'
+    except (UnicodeDecodeError, ValueError):
+        return 'cp932'
+
+
+def import_ics(path: str, kind: str = 'event', alarm: int = 7,
+               encoding: Optional[str] = None) -> List[Appointment]:
     """
     ICSファイルを読み込み Appointment リストを返す。
     kind: 'appt' or 'event' (ToDoはVTODO対応予定)
+    encoding: None=自動検出, 'utf-8', 'cp932' など
     """
-    with open(path, 'r', encoding='utf-8', errors='replace') as f:
+    if encoding:
+        enc = encoding
+    else:
+        enc = _detect_ics_encoding(path)
+        print(f"  ICS encoding detected: {enc}", file=__import__('sys').stderr)
+    with open(path, 'r', encoding=enc, errors='replace') as f:
         raw = f.read()
 
     text = _ics_unfold(raw)
@@ -1287,6 +1313,9 @@ def main():
     parser.add_argument('--csv-encoding', dest='csv_encoding',
                         default='utf-8', choices=['utf-8', 'cp932', 'shift-jis'],
                         help='CSV入出力エンコーディング (デフォルト: utf-8)')
+    parser.add_argument('--ics-encoding', dest='ics_encoding',
+                        default=None, metavar='ENC',
+                        help='ICS入力エンコーディング (デフォルト: 自動検出。例: utf-8, cp932)')
     parser.add_argument('--silent', '-s', dest='silent', nargs='?', const='1',
                         default='0', metavar='N',
                         help='出力抑制 0=通常 1=進捗非表示 2=全て抑制')
@@ -1338,7 +1367,8 @@ def main():
             print(f"Importing {args.input_data} as {kind_str} ...", file=sys.stderr)
         try:
             if ext == '.ics':
-                new_appts = import_ics(args.input_data, kind=kind_str, alarm=alarm_val)
+                new_appts = import_ics(args.input_data, kind=kind_str, alarm=alarm_val,
+                                       encoding=args.ics_encoding)
             else:
                 new_appts = import_csv(args.input_data, kind=kind_str,
                                        encoding=csv_enc, alarm=alarm_val)
