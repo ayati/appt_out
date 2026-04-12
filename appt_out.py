@@ -741,10 +741,12 @@ def export_csv(appointments: List[Appointment],
                date_start: int = 19000101,
                date_end: int = 22000101,
                output=None,
-               encoding: str = 'utf-8'):
+               encoding: str = 'utf-8',
+               tab_mode: bool = False):
     """
-    CSV出力。output=Noneなら sys.stdout に書く。
+    CSV/TSV出力。output=Noneなら sys.stdout に書く。
     encoding: 'utf-8' or 'cp932'
+    tab_mode: True でタブ区切り・クォートなし出力 (-b 相当)
     """
     if output is None:
         if encoding == 'cp932':
@@ -756,7 +758,16 @@ def export_csv(appointments: List[Appointment],
     else:
         close_output = False
 
-    writer = csv.writer(output, quoting=csv.QUOTE_ALL, lineterminator='\r\n')
+    if tab_mode:
+        # タブ区切り: フィールド内のタブ・改行はスペースに置換してクォートなしで出力
+        def _write_row(row):
+            fields = [str(f).replace('\t', ' ').replace('\r', '').replace('\n', ' ')
+                      for f in row]
+            output.write('\t'.join(fields) + '\r\n')
+        writer_writerow = _write_row
+    else:
+        _csv_writer = csv.writer(output, quoting=csv.QUOTE_ALL, lineterminator='\r\n')
+        writer_writerow = _csv_writer.writerow
 
     for appt in appointments:
         # 日付フィルタ
@@ -807,7 +818,7 @@ def export_csv(appointments: List[Appointment],
                 end_s   = _fmt_date_raw(ri.end_year, ri.end_month, ri.end_day)
                 row += [str(ri.freq), days_s, month_s, start_s, end_s, str(ri.delete_count)]
 
-            writer.writerow(row)
+            writer_writerow(row)
 
         elif appt.kind == KIND_TODO:
             complete_s = _fmt_date_raw(appt.complete_year, appt.complete_month, appt.complete_day)
@@ -838,7 +849,7 @@ def export_csv(appointments: List[Appointment],
                 end_s   = _fmt_date_raw(ri.end_year, ri.end_month, ri.end_day)
                 row += [str(ri.freq), days_s, month_s, start_s, end_s, str(ri.delete_count)]
 
-            writer.writerow(row)
+            writer_writerow(row)
 
 
 # ---------------------------------------------------------------------------
@@ -1150,18 +1161,21 @@ def _detect_ics_encoding(path: str) -> str:
         return 'cp932'
 
 
-def import_ics(path: str, kind: str = 'event', alarm: int = 7,
+def import_ics(path: str, alarm: int = 7, date_from: int = 0,
                encoding: Optional[str] = None) -> List[Appointment]:
     """
     ICSファイルを読み込み Appointment リストを返す。
-    kind: 'appt' or 'event' (ToDoはVTODO対応予定)
-    encoding: None=自動検出, 'utf-8', 'cp932' など
+    DTSTART に時刻があれば Appointment、終日なら Event として自動判定する。
+
+    alarm:     アラーム設定 (0-7)
+    date_from: この日付 (yyyymmdd int) より前のイベントを除外。0=フィルタなし。
+    encoding:  None=自動検出, 'utf-8', 'cp932' など
     """
     if encoding:
         enc = encoding
     else:
         enc = _detect_ics_encoding(path)
-        print(f"  ICS encoding detected: {enc}", file=__import__('sys').stderr)
+        print(f"  ICS encoding detected: {enc}", file=sys.stderr)
     with open(path, 'r', encoding=enc, errors='replace') as f:
         raw = f.read()
 
@@ -1172,13 +1186,6 @@ def import_ics(path: str, kind: str = 'event', alarm: int = 7,
     in_vevent = False
     props: Dict[str, str] = {}
 
-    if kind == 'appt':
-        base_kind  = KIND_APPOINTMENT
-        base_flags = 128 + alarm
-    else:
-        base_kind  = KIND_EVENT
-        base_flags = 38
-
     for line in lines:
         if line.strip() == 'BEGIN:VEVENT':
             in_vevent = True
@@ -1186,19 +1193,18 @@ def import_ics(path: str, kind: str = 'event', alarm: int = 7,
             continue
         if line.strip() == 'END:VEVENT':
             in_vevent = False
-            # VEVENTを1件のAppointmentに変換
-            appt = _vevent_to_appointment(props, base_kind, base_flags)
+            appt = _vevent_to_appointment(props, alarm)
             if appt is not None:
+                # 日付フィルタ: date_from より前のイベントは除外
+                if date_from > 0 and appt.has_date and appt.start_date_int < date_from:
+                    continue
                 results.append(appt)
             continue
         if in_vevent and ':' in line:
-            # key;params:value
             colon_idx = line.index(':')
             key_part = line[:colon_idx]
             value = line[colon_idx+1:]
-            # セミコロンパラメータを持つキー (DTSTART;TZID=...)
             key = key_part.split(';')[0].upper()
-            # TZIDパラメータ取得
             if ';TZID=' in key_part.upper():
                 tzid = key_part.split('TZID=')[-1]
                 props[key + '_TZID'] = tzid
@@ -1208,11 +1214,23 @@ def import_ics(path: str, kind: str = 'event', alarm: int = 7,
 
 
 def _vevent_to_appointment(props: Dict[str, str],
-                           base_kind: int, base_flags: int) -> Optional[Appointment]:
-    """VEVENTプロパティ辞書 → Appointment"""
+                           alarm: int = 7) -> Optional[Appointment]:
+    """
+    VEVENTプロパティ辞書 → Appointment。
+    DTSTART に時刻が含まれる場合は Appointment (cFlags=128+alarm)、
+    終日イベント (VALUE=DATE) の場合は Event (cFlags=38) として登録する。
+    """
     appt = Appointment()
-    appt.kind  = base_kind
-    appt.flags = base_flags
+
+    # DTSTART を先に読んで種別を自動判定
+    dtstart_raw = props.get('DTSTART', '')
+    is_timed = 'T' in dtstart_raw   # 時刻あり=Appointment, なし=Event
+    if is_timed:
+        appt.kind  = KIND_APPOINTMENT
+        appt.flags = 128 + alarm
+    else:
+        appt.kind  = KIND_EVENT
+        appt.flags = 38
 
     # SUMMARY → description
     appt.description = props.get('SUMMARY', '').strip()
@@ -1226,8 +1244,7 @@ def _vevent_to_appointment(props: Dict[str, str],
     desc = desc.replace('\\n', '\n').replace('\\,', ',').replace('\\;', ';').replace('\\\\', '\\')
     appt.note = desc
 
-    # DTSTART
-    dtstart_raw = props.get('DTSTART', '')
+    # DTSTART (dtstart_raw は関数先頭で取得済み)
     dtstart = _ics_parse_dt(dtstart_raw) if dtstart_raw else None
 
     if dtstart:
@@ -1235,8 +1252,7 @@ def _vevent_to_appointment(props: Dict[str, str],
         appt.start_month = (dtstart.month - 1) & 0xFF
         appt.start_day   = (dtstart.day   - 1) & 0xFF
 
-        # 時刻情報があれば
-        if 'T' in dtstart_raw:
+        if is_timed:
             appt.start_time = dtstart.hour * 60 + dtstart.minute
         else:
             appt.start_time = None  # 終日イベント
@@ -1329,49 +1345,69 @@ def _parse_yymmdd(s: str) -> int:
 
 
 def main():
+    from datetime import date as _date
     parser = argparse.ArgumentParser(
         prog='appt_out.py',
         description='HP 200LX *.adb Appointment Book 入出力ツール'
     )
     parser.add_argument('-x', dest='input_adb', metavar='FILE',
                         required=True, help='入力ADBファイル (必須)')
-    parser.add_argument('-i', dest='input_data', metavar='FILE',
-                        help='取り込むCSV/ICSファイル')
+
+    # 入力: ICS と CSV は専用オプションで分離
+    parser.add_argument('--ics', dest='input_ics', metavar='FILE',
+                        help='取り込む ICS ファイル (終日→Event, 時間あり→Appointment 自動判定)')
+    parser.add_argument('--ics-from', dest='ics_from', metavar='YYMMDD', default=None,
+                        help='ICS 取り込み開始日 (デフォルト: 前年1/1。0=フィルタなし)')
+    parser.add_argument('-i', dest='input_csv', metavar='FILE',
+                        help='取り込む CSV ファイル (要 -a/-e/-t)')
+
     parser.add_argument('-o', dest='output_adb', metavar='FILE',
                         help='出力ADBファイル')
 
-    # 種別フィルタ
+    # 種別フィルタ (CSV 取り込み / ADB→CSV 出力に使用)
     kind_grp = parser.add_mutually_exclusive_group()
     kind_grp.add_argument('-a', dest='appt', nargs='?', const='1', default=None,
-                          metavar='N', help='Appointment出力 (0-3)')
+                          metavar='N', help='Appointment 出力/CSV取込 (0-3)')
     kind_grp.add_argument('-e', dest='event', nargs='?', const='1', default=None,
-                          metavar='N', help='Event出力/取込')
+                          metavar='N', help='Event 出力/CSV取込 (0-3)')
     kind_grp.add_argument('-t', dest='todo', nargs='?', const='1', default=None,
-                          metavar='N', help='ToDo出力 (0-4)')
+                          metavar='N', help='ToDo 出力 (0-4)')
 
     parser.add_argument('-m', dest='merge', action='store_true',
                         help='新規作成モード (既存データをコピーしない)')
-    parser.add_argument('--dedup', dest='dedup', action='store_true',
-                        help='重複スキップモード: 既存ADBと一致する予定はインポートしない')
+
+    # dedup: CSV は opt-in (--dedup)、ICS は opt-out (--no-dedup)
+    dedup_grp = parser.add_mutually_exclusive_group()
+    dedup_grp.add_argument('--dedup', dest='dedup', action='store_true', default=False,
+                           help='CSV 取り込み時の重複スキップを有効化')
+    dedup_grp.add_argument('--no-dedup', dest='no_dedup', action='store_true', default=False,
+                           help='ICS 取り込み時の重複スキップを無効化 (デフォルトは ON)')
+
     parser.add_argument('-n', dest='note_mode', nargs='?', const='2', default='2',
-                        metavar='N', help='NOTEの改行処理 0=そのまま 1=スペース 2=\\n(デフォルト)')
+                        metavar='N', help='NOTE 改行処理 0=そのまま 1=スペース 2=\\n (デフォルト)')
     parser.add_argument('-r', dest='alarm', nargs='?', const='7', default='7',
-                        metavar='N', help='アラーム/月表示/週表示設定 0-7 (デフォルト:7)')
+                        metavar='N', help='アラーム/月表示/週表示設定 0-7 (デフォルト: 7)')
     parser.add_argument('-g', dest='date_start', metavar='YYMMDD',
-                        help='出力開始日 (例: 260101)')
+                        help='CSV 出力開始日 (例: 260101)')
     parser.add_argument('-f', dest='date_end', metavar='YYMMDD',
-                        help='出力終了日 (例: 261231)')
+                        help='CSV 出力終了日 (例: 261231)')
+    parser.add_argument('-b', dest='tab_mode', action='store_true',
+                        help='タブ区切り出力 (デフォルト: CSV)')
     parser.add_argument('--csv-encoding', dest='csv_encoding',
                         default='utf-8', choices=['utf-8', 'cp932', 'shift-jis'],
-                        help='CSV入出力エンコーディング (デフォルト: utf-8)')
+                        help='CSV 入出力エンコーディング (デフォルト: utf-8)')
     parser.add_argument('--ics-encoding', dest='ics_encoding',
                         default=None, metavar='ENC',
-                        help='ICS入力エンコーディング (デフォルト: 自動検出。例: utf-8, cp932)')
+                        help='ICS 入力エンコーディング (デフォルト: 自動検出)')
     parser.add_argument('--silent', '-s', dest='silent', nargs='?', const='1',
                         default='0', metavar='N',
                         help='出力抑制 0=通常 1=進捗非表示 2=全て抑制')
 
     args = parser.parse_args()
+
+    # --ics と -i の同時指定はエラー
+    if args.input_ics and args.input_csv:
+        parser.error('--ics と -i は同時に指定できません')
 
     # エンコーディング正規化
     csv_enc = 'cp932' if args.csv_encoding in ('cp932', 'shift-jis') else 'utf-8'
@@ -1381,12 +1417,10 @@ def main():
     include_event = int(args.event) if args.event is not None else 0
     include_todo  = int(args.todo)  if args.todo  is not None else 0
 
-    # デフォルト: Appointmentを出力
+    # 出力モード指定なし・入力なし → Appointment 出力をデフォルトとする
     if args.appt is None and args.event is None and args.todo is None:
-        if args.input_data is None:
+        if args.input_ics is None and args.input_csv is None:
             include_appt = 1
-        # 入力ありの場合はユーザが指定すべきだが、デフォルトeventにしておく
-        # (元のapptoutと同様: -i指定時は -a/-e/-t のいずれかが必要)
 
     note_mode = int(args.note_mode or '2')
     alarm_val = int(args.alarm or '7')
@@ -1394,6 +1428,13 @@ def main():
 
     date_start = _parse_yymmdd(args.date_start) if args.date_start else 19000101
     date_end   = _parse_yymmdd(args.date_end)   if args.date_end   else 22000101
+
+    # ICS 取り込み開始日: デフォルト = 前年 1/1
+    if args.ics_from is not None:
+        ics_from_val = _parse_yymmdd(args.ics_from) if args.ics_from != '0' else 0
+    else:
+        last_year = _date.today().year - 1
+        ics_from_val = last_year * 10000 + 101  # 前年 1/1
 
     # ADB読み込み
     if silent < 2:
@@ -1408,28 +1449,48 @@ def main():
     if silent < 2:
         print(f"  {len(adb.appointments)} records loaded.", file=sys.stderr)
 
-    # CSV/ICS取り込み
+    # ICS 取り込み
     new_appts: List[Appointment] = []
-    if args.input_data:
-        ext = os.path.splitext(args.input_data)[1].lower()
-        kind_str = ('event' if include_event else
-                    'todo'  if include_todo  else 'appt')
+    if args.input_ics:
         if silent < 2:
-            print(f"Importing {args.input_data} as {kind_str} ...", file=sys.stderr)
+            print(f"Importing {args.input_ics} (ICS, auto-detect kind) ...", file=sys.stderr)
+            if ics_from_val > 0:
+                print(f"  Date filter: {ics_from_val} 以降", file=sys.stderr)
         try:
-            if ext == '.ics':
-                new_appts = import_ics(args.input_data, kind=kind_str, alarm=alarm_val,
-                                       encoding=args.ics_encoding)
-            else:
-                new_appts = import_csv(args.input_data, kind=kind_str,
-                                       encoding=csv_enc, alarm=alarm_val)
+            new_appts = import_ics(args.input_ics, alarm=alarm_val,
+                                   date_from=ics_from_val,
+                                   encoding=args.ics_encoding)
         except Exception as e:
-            print(f"Error importing {args.input_data}: {e}", file=sys.stderr)
+            print(f"Error importing ICS: {e}", file=sys.stderr)
             sys.exit(1)
         if silent < 2:
             print(f"  {len(new_appts)} records imported.", file=sys.stderr)
 
-        # 重複スキップ
+        # ICS: dedup はデフォルト ON (--no-dedup で無効化)
+        if not args.no_dedup and not args.merge:
+            new_appts, skipped = deduplicate(adb.appointments, new_appts)
+            if silent < 2:
+                print(f"  {skipped} records skipped (duplicate).", file=sys.stderr)
+                print(f"  {len(new_appts)} records will be added.", file=sys.stderr)
+
+    # CSV 取り込み
+    elif args.input_csv:
+        if args.appt is None and args.event is None and args.todo is None:
+            parser.error('CSV 取り込みには -a / -e / -t のいずれかを指定してください')
+        kind_str = ('event' if include_event else
+                    'todo'  if include_todo  else 'appt')
+        if silent < 2:
+            print(f"Importing {args.input_csv} as {kind_str} ...", file=sys.stderr)
+        try:
+            new_appts = import_csv(args.input_csv, kind=kind_str,
+                                   encoding=csv_enc, alarm=alarm_val)
+        except Exception as e:
+            print(f"Error importing CSV: {e}", file=sys.stderr)
+            sys.exit(1)
+        if silent < 2:
+            print(f"  {len(new_appts)} records imported.", file=sys.stderr)
+
+        # CSV: dedup は opt-in (--dedup)
         if args.dedup and not args.merge:
             new_appts, skipped = deduplicate(adb.appointments, new_appts)
             if silent < 2:
@@ -1437,7 +1498,8 @@ def main():
                 print(f"  {len(new_appts)} records will be added.", file=sys.stderr)
         elif args.dedup and args.merge:
             if silent < 2:
-                print("  Warning: --dedup is ignored with -m (new mode).", file=sys.stderr)
+                print("  Warning: --dedup は -m (新規作成モード) では無視されます。",
+                      file=sys.stderr)
 
     # ADB書き出し
     if args.output_adb:
@@ -1452,7 +1514,7 @@ def main():
         if silent < 2:
             print("Done.", file=sys.stderr)
 
-    # CSV出力 (出力ファイル指定なし or 常に)
+    # CSV/TSV 出力
     if args.output_adb is None or (include_appt or include_event or include_todo):
         if include_appt or include_event or include_todo:
             if csv_enc == 'cp932':
@@ -1471,6 +1533,7 @@ def main():
                 date_end=date_end,
                 output=out_stream,
                 encoding=csv_enc,
+                tab_mode=args.tab_mode,
             )
 
 
