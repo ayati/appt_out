@@ -15,6 +15,7 @@ import sys
 import io
 import os
 import csv
+import re
 import struct
 import argparse
 from dataclasses import dataclass, field
@@ -51,6 +52,9 @@ REPEAT_WEEKLY  = 4
 REPEAT_MONTHLY = 8
 REPEAT_YEARLY  = 16
 REPEAT_CUSTOM  = 32
+
+# ICS 取り込みで RRULE に UNTIL がない場合の繰り返し終了年 (12/31 まで)
+ICS_REPEAT_END_YEAR = 2099
 
 # NRA構造体サイズ (frw.cより: 2+2+2+2+2+2+2+1+1+1+1+1+1+2+1+1+1+1+1 = 27)
 NRA_SIZE  = 27
@@ -123,6 +127,9 @@ class Appointment:
 
     # 内部管理
     note_rec_num: int = -1   # -1 = ノートなし
+    # ADB から読んだ時刻フィールドの生バイト (pri1, pri2, end1, end2)。
+    # 時刻なしは 00 00 / FF FF の両方があり得るため、既存レコードは元の値で書き戻す。
+    raw_times: Optional[bytes] = None
     record_num: int = 0
 
     @property
@@ -305,6 +312,8 @@ def _data_to_appointment(rec_data: bytes, notes: Dict[int, str]) -> Optional[App
         # Appointment/Event
         appt.start_time = _decode_time(nra['cStartTimePri1'], nra['cStartTimePri2'])
         appt.end_time   = _decode_time(nra['cEndTimeYear'], nra['cEndTimeMonth'])
+        appt.raw_times = bytes([nra['cStartTimePri1'], nra['cStartTimePri2'],
+                                nra['cEndTimeYear'], nra['cEndTimeMonth']])
         appt.lead_time_day = nra['cLeadTimeDay']
         appt.lead_time     = nra['cLeadTime']
 
@@ -417,11 +426,12 @@ class ADBFile:
         out_appts.sort(key=_sort_key)
 
         # ノート番号を事前割り当て (ソート後順序)
-        # NOTE の iRecord は DATA の iRecord と重複しないよう len(out_appts) 以降から割り当てる。
-        # DATA iRecord は 0..N-1、NOTE iRecord は N.. とすることで
-        # HP 200LX が iNoteRecNum を辿る際に DATA レコードと誤認識しない。
+        # NOTE の iRecord は 0 から連番で割り当てる (DOS apptout.exe と同じ)。
+        # HP 200LX は LookupTable の「type別開始位置 + iRecord」でレコードを引くため、
+        # iRecord は種別ごとの 0 始まり連番でなければならない (DATA と重複してよい)。
+        # N 以降から振ると iNoteRecNum が NOTE 範囲外を指し "Record not found" になる。
         note_assignments: List[int] = []
-        note_num = len(out_appts)
+        note_num = 0
         for appt in out_appts:
             if appt.note:
                 note_assignments.append(note_num)
@@ -429,28 +439,38 @@ class ADBFile:
             else:
                 note_assignments.append(-1)
 
-        # 同一日付グループ内の iPrev/iNextRecNum を構築
-        # data_num = 0-based index in out_appts (ソート後)
+        # 繰り返しの Appointment/Event は HP 200LX 実機では日付リスト・日付インデックスに入れず、
+        # 繰り返しレコードだけの連結リスト (先頭は TYPE_14[0] bytes[17:19]) で管理される。
+        # 実機はこのリストをたどって各発生日を展開するため、ここに無いと基準日にしか表示されない。
+        def _is_repeat(a: Appointment) -> bool:
+            return a.repeat_type > REPEAT_NONE and a.repeat is not None and a.kind != KIND_TODO
+
         prev_recs = [-1] * len(out_appts)
         next_recs = [-1] * len(out_appts)
-        i = 0
-        while i < len(out_appts):
-            a = out_appts[i]
-            j = i + 1
-            while j < len(out_appts):
-                b = out_appts[j]
-                if (b.start_year, b.start_month, b.start_day) == \
-                   (a.start_year, a.start_month, a.start_day):
-                    j += 1
-                else:
-                    break
-            # i..j-1 が同一日付グループ
-            for k in range(i, j):
-                if k > i:
-                    prev_recs[k] = k - 1
-                if k < j - 1:
-                    next_recs[k] = k + 1
-            i = j
+
+        # 繰り返しレコードの連結リスト (data_num 順)
+        repeat_nums = [n for n, a in enumerate(out_appts) if _is_repeat(a)]
+        for k, n in enumerate(repeat_nums):
+            if k > 0:
+                prev_recs[n] = repeat_nums[k - 1]
+            if k < len(repeat_nums) - 1:
+                next_recs[n] = repeat_nums[k + 1]
+        repeat_head = repeat_nums[0] if repeat_nums else -1
+
+        # 同一日付グループ内の iPrev/iNextRecNum を構築 (繰り返しレコードを除く)
+        # data_num = 0-based index in out_appts (ソート後)
+        group_start: Dict[tuple, int] = {}   # 日付 → グループ先頭 data_num
+        last_in_group: Dict[tuple, int] = {}
+        for n, a in enumerate(out_appts):
+            if _is_repeat(a):
+                continue
+            d = (a.start_year, a.start_month, a.start_day)
+            if d in last_in_group:
+                prev_recs[n] = last_in_group[d]
+                next_recs[last_in_group[d]] = n
+            else:
+                group_start[d] = n
+            last_in_group[d] = n
 
         # TYPE_14 レコードを他のヘッダレコードと分離する。
         # TYPE_14[1] は日付→iRecord のインデックステーブルで、データ書き込み後に
@@ -468,7 +488,8 @@ class ADBFile:
         # エントリは日付順（= data_num 順）に並べ、末尾に終端 5a0000ffff を付ける。
         date_index_entries: List[bytes] = []
         for data_num, appt in enumerate(out_appts):
-            if prev_recs[data_num] == -1 and appt.has_date:
+            if appt.has_date and not _is_repeat(appt) and \
+               group_start.get((appt.start_year, appt.start_month, appt.start_day)) == data_num:
                 date_index_entries.append(bytes([
                     appt.start_year  & 0xFF,
                     appt.start_month & 0xFF,
@@ -479,11 +500,13 @@ class ADBFile:
         type14_1_payload = b''.join(date_index_entries) + bytes([0x5A, 0x00, 0x00, 0xFF, 0xFF])
         n_unique_dates = len(date_index_entries)
 
-        # TYPE_14[0]: bytes[19:21] (LE short) にユニーク日付数を書き込む
+        # TYPE_14[0]: bytes[17:19] (LE short) に繰り返しリストの先頭 (-1=なし)、
+        #             bytes[19:21] (LE short) にユニーク日付数を書き込む
         if 0 in type14_map:
             cStatus_t14_0, payload_t14_0 = type14_map[0]
             pa = bytearray(payload_t14_0)
             if len(pa) >= 21:
+                struct.pack_into('<h', pa, 17, repeat_head)
                 struct.pack_into('<H', pa, 19, n_unique_dates)
             type14_0_payload = bytes(pa)
         else:
@@ -592,9 +615,14 @@ class ADBFile:
 # ---------------------------------------------------------------------------
 
 def _encode_time(minutes: Optional[int]) -> Tuple[int, int]:
-    """分 → (cPri1, cPri2). NONE時は (0x00, 0x00)"""
+    """分 → (cPri1, cPri2). NONE時は (0xFF, 0xFF)
+
+    HP 200LX 実機が時刻なしイベントに書く値は FFFF。00 00 だと 0:00 扱いになり、
+    繰り返しイベントを実機で編集するとエラーデータになる。
+    (DOS apptout は setappt.c の NONE 判定バグで 00 00 を書いていた)
+    """
     if minutes is None:
-        return (0x00, 0x00)
+        return (0xFF, 0xFF)
     return (minutes & 0xFF, (minutes >> 8) & 0xFF)
 
 
@@ -667,6 +695,13 @@ def _appointment_to_data(appt: Appointment, note_rec_num: int,
         # Start/End time
         st1, st2 = _encode_time(appt.start_time)
         et1, et2 = _encode_time(appt.end_time)
+        raw = appt.raw_times
+        if raw is not None:
+            # 読み込み時から時刻が変わっていなければ元のバイトを維持
+            if _decode_time(raw[0], raw[1]) == appt.start_time:
+                st1, st2 = raw[0], raw[1]
+            if _decode_time(raw[2], raw[3]) == appt.end_time:
+                et1, et2 = raw[2], raw[3]
         nra[18] = st1; nra[19] = st2
         nra[22] = et1; nra[23] = et2
         nra[24] = appt.lead_time_day & 0xFF
@@ -713,7 +748,7 @@ def _repeat_month_str(month: int) -> str:
         return str(month)
     names = ["JAN","FEB","MAR","APR","MAY","JUN",
              "JUL","AUG","SEP","OCT","NOV","DEC"]
-    bits  = [1,2,4,8,16,32,64,128,256,512,2048,1024]
+    bits  = [1 << i for i in range(12)]
     parts = [n for n, b in zip(names, bits) if month & b]
     return ",".join(parts)
 
@@ -899,8 +934,8 @@ def _repeat_month_parse(s: str) -> int:
     if 'AUG' in s: m |= 128
     if 'SEP' in s: m |= 256
     if 'OCT' in s: m |= 512
-    if 'DEC' in s: m |= 1024
-    if 'NOV' in s: m |= 2048
+    if 'NOV' in s: m |= 1024
+    if 'DEC' in s: m |= 2048
     return m
 
 
@@ -1066,6 +1101,44 @@ def _ics_parse_dt(value: str, tzid: Optional[str] = None) -> Optional[datetime]:
         return None
 
 
+def _nth_weekday_days(byday: str, day_map: Dict[str, int]) -> Optional[int]:
+    """BYDAY (例: '1TH', '3TH', '2SA,4SA') → RIA days (下位: 0x80|曜日ビット, 上位: 週ビット)。
+
+    週は番号ではなくビット: 第1=0x01, 第2=0x02, 第3=0x04, 第4=0x08, 最終=0x10
+    (実機手入力の第1木曜 weeks=0x01, 第2土曜 0x02, 第3木曜 0x04, 最終金曜 0x10 で確認)。
+    HP 200LX で表現できない指定 (第5週、最終以外の負の値など) は None を返す。
+    """
+    day_bits = 0
+    week_bits = 0
+    for part in byday.split(','):
+        m = re.match(r'([+-]?\d*)([A-Z]{2})', part.strip())
+        if not m:
+            continue
+        day_bits |= day_map.get(m.group(2), 0)
+        nth = int(m.group(1)) if m.group(1) not in ('', '+', '-') else 0
+        if 1 <= nth <= 4:
+            week_bits |= 1 << (nth - 1)
+        elif nth == -1:
+            week_bits |= 0x10
+        else:
+            return None
+    return 0x80 + day_bits + week_bits * 256
+
+
+def _month_day(params: Dict[str, str], dtstart: Optional[datetime], byday: str) -> int:
+    """日付指定の繰り返し日 (BYMONTHDAY、なければ DTSTART の日)。"""
+    bymd = params.get('BYMONTHDAY', '').split(',')[0].strip()
+    if bymd.isdigit():
+        return int(bymd)
+    if dtstart is None:
+        return 0
+    if byday:
+        print(f"  Warning: BYDAY={byday} は HP 200LX で表現できないため "
+              f"毎月{dtstart.day}日の繰り返しとして登録します ({dtstart:%Y/%m/%d})",
+              file=sys.stderr)
+    return dtstart.day
+
+
 def _rrule_to_repeat(rrule: str, dtstart: Optional[datetime]) -> Tuple[int, Optional[RepeatInfo]]:
     """RRULE文字列 → (repeat_type, RepeatInfo)"""
     params = {}
@@ -1085,38 +1158,38 @@ def _rrule_to_repeat(rrule: str, dtstart: Optional[datetime]) -> Tuple[int, Opti
     ri.freq = interval
 
     repeat_type = REPEAT_NONE
+    day_map = {'MO': 0x01, 'TU': 0x02, 'WE': 0x04,
+               'TH': 0x08, 'FR': 0x10, 'SA': 0x20, 'SU': 0x40}
 
     if freq_str == 'DAILY':
         repeat_type = REPEAT_DAILY
 
     elif freq_str == 'WEEKLY':
         repeat_type = REPEAT_WEEKLY
-        day_map = {'MO': 0x01, 'TU': 0x02, 'WE': 0x04,
-                   'TH': 0x08, 'FR': 0x10, 'SA': 0x20, 'SU': 0x40}
         bits = 0
         for d in byday.split(','):
             d = d.strip()
             for k, v in day_map.items():
                 if d.endswith(k):
                     bits |= v
+        if bits == 0 and dtstart:
+            # BYDAY なし: DTSTART の曜日 (RFC 5545)
+            bits = 1 << dtstart.weekday()
         ri.days = bits + 128  # 128 = weekly フラグ
 
     elif freq_str == 'MONTHLY':
         repeat_type = REPEAT_MONTHLY
         if byday:
-            # Nth weekday
-            import re
-            m = re.match(r'(-?\d+)([A-Z]{2})', byday.strip())
-            if m:
-                nth = int(m.group(1))
-                day_map = {'MO': 0x01, 'TU': 0x02, 'WE': 0x04,
-                           'TH': 0x08, 'FR': 0x10, 'SA': 0x20, 'SU': 0x40}
-                bits = day_map.get(m.group(2), 0)
-                ri.days = bits + nth * 256
+            # 第N週の曜日
+            ri.days = _nth_weekday_days(byday, day_map)
+        if ri.days is None or not byday:
+            ri.days = _month_day(params, dtstart, byday)
 
     elif freq_str == 'YEARLY':
         repeat_type = REPEAT_YEARLY
-        month_bits_map = [1,2,4,8,16,32,64,128,256,512,2048,1024]
+        # 月ビット: 1月=0x001 ... 11月=0x400, 12月=0x800 (実機手入力データで確認)。
+        # DOS apptout (getrpmth.c) は 11月/12月が逆になっている。
+        month_bits_map = [1 << i for i in range(12)]
         bits = 0
         for mn in bymonth.split(','):
             mn = mn.strip()
@@ -1124,7 +1197,17 @@ def _rrule_to_repeat(rrule: str, dtstart: Optional[datetime]) -> Tuple[int, Opti
                 idx = int(mn) - 1
                 if 0 <= idx < 12:
                     bits |= month_bits_map[idx]
+        if bits == 0 and dtstart:
+            # BYMONTH なし: DTSTART の月 (RFC 5545)
+            bits = month_bits_map[dtstart.month - 1]
         ri.month = bits
+        # HP 200LX の年繰り返しは days (日) と month (月ビット) の両方が必要。
+        # days=0 だと発生日がなく、初回以降の年に表示されない。
+        if byday:
+            # 第N週の曜日 (MONTHLY と同じ表現)
+            ri.days = _nth_weekday_days(byday, day_map)
+        if ri.days is None or not byday:
+            ri.days = _month_day(params, dtstart, byday)
 
     # Until (繰り返し終了日)
     if until_str:
@@ -1133,6 +1216,12 @@ def _rrule_to_repeat(rrule: str, dtstart: Optional[datetime]) -> Tuple[int, Opti
             ri.end_year  = (until_dt.year - 1900) & 0xFF
             ri.end_month = (until_dt.month - 1) & 0xFF
             ri.end_day   = (until_dt.day - 1) & 0xFF
+    else:
+        # UNTIL なし (無期限): DOS apptout 既定の 1999 年では現在以降に発生しないため
+        # 2099/12/31 を終了日とする
+        ri.end_year  = ICS_REPEAT_END_YEAR - 1900
+        ri.end_month = 11
+        ri.end_day   = 30
 
     # Start (dtstart)
     if dtstart:
@@ -1141,6 +1230,21 @@ def _rrule_to_repeat(rrule: str, dtstart: Optional[datetime]) -> Tuple[int, Opti
         ri.start_day   = (dtstart.day - 1) & 0xFF
 
     return repeat_type, ri if repeat_type != REPEAT_NONE else None
+
+
+def _add_deleted_date(ri: RepeatInfo, dt: datetime):
+    """繰り返しの削除済み発生日リストに日付を追加する。
+
+    1 件 4 バイト: (year-1900, month-1, day-1, 0x00)、日付順。
+    (実機で第3木曜の繰り返しから 12/17 を削除したデータ 7e 0b 10 00 で確認)
+    """
+    entry = bytes([(dt.year - 1900) & 0xFF, dt.month - 1, dt.day - 1, 0])
+    entries = {ri.deleted[i:i + 4] for i in range(0, len(ri.deleted), 4)}
+    if entry in entries or len(entries) >= 255:
+        return
+    entries.add(entry)
+    ri.deleted = b''.join(sorted(entries))
+    ri.delete_count = len(entries)
 
 
 def _detect_ics_encoding(path: str) -> str:
@@ -1186,6 +1290,9 @@ def import_ics(path: str, alarm: int = 7, date_from: int = 0,
     results = []
     in_vevent = False
     props: Dict[str, str] = {}
+    # 繰り返しの親 (UID → Appointment) と、RECURRENCE-ID 付きの変更回
+    series: Dict[str, Appointment] = {}
+    overrides: List[Tuple[Dict[str, str], Appointment]] = []
 
     for line in lines:
         if line.strip() == 'BEGIN:VEVENT':
@@ -1196,9 +1303,16 @@ def import_ics(path: str, alarm: int = 7, date_from: int = 0,
             in_vevent = False
             appt = _vevent_to_appointment(props, alarm)
             if appt is not None:
+                # 変更回は日付フィルタ前に集める (親の発生日を消すため)
+                if 'RECURRENCE-ID' in props:
+                    overrides.append((props, appt))
+                    continue
                 # 日付フィルタ: date_from より前のイベントは除外
                 if date_from > 0 and appt.has_date and appt.start_date_int < date_from:
                     continue
+                uid = props.get('UID', '').strip()
+                if appt.repeat is not None and uid:
+                    series[uid] = appt
                 results.append(appt)
             continue
         if in_vevent and ':' in line:
@@ -1209,7 +1323,32 @@ def import_ics(path: str, alarm: int = 7, date_from: int = 0,
             if ';TZID=' in key_part.upper():
                 tzid = key_part.split('TZID=')[-1]
                 props[key + '_TZID'] = tzid
-            props[key] = value
+            if key == 'EXDATE' and key in props:
+                # EXDATE は複数行あり得るのでカンマで連結
+                props[key] += ',' + value
+            else:
+                props[key] = value
+
+    for oprops, oappt in overrides:
+        parent = series.get(oprops.get('UID', '').strip())
+        rid = _ics_parse_dt(oprops['RECURRENCE-ID'])
+        if (parent is not None and rid is not None
+                and (rid.year - 1900, rid.month - 1, rid.day - 1) ==
+                    (parent.start_year, parent.start_month, parent.start_day) ==
+                    (oappt.start_year, oappt.start_month, oappt.start_day)):
+            # 初回の発生日を同じ日のまま変更した回: 親の繰り返しに内容を反映して 1 件にする
+            # (別レコードにすると同じ日に親と変更回の 2 件が並ぶ)
+            oappt.repeat_type = parent.repeat_type
+            oappt.repeat = parent.repeat
+            idx = next(i for i, x in enumerate(results) if x is parent)
+            results[idx] = oappt
+            continue
+        if parent is not None and rid is not None:
+            # 親の元の発生日を削除済みにし、変更回は単独の予定として登録
+            _add_deleted_date(parent.repeat, rid)
+        if date_from > 0 and oappt.has_date and oappt.start_date_int < date_from:
+            continue
+        results.append(oappt)
 
     return results
 
@@ -1272,6 +1411,9 @@ def _vevent_to_appointment(props: Dict[str, str],
         # 終日イベントの複数日: HP 200LX は iEndDate!=0 のレコードを誤判定するため
         # DOS apptout と同様に常に 0 にする。開始日のみの単日イベントとして登録。
         # appt.consec_days は既定値 0 のままにする。
+    elif is_timed and dtstart:
+        # DTEND なし (RFC 5545: 期間 0) → 終了時刻 = 開始時刻
+        appt.end_time = appt.start_time
 
     # RRULE → 繰り返し情報
     rrule = props.get('RRULE', '')
@@ -1279,6 +1421,11 @@ def _vevent_to_appointment(props: Dict[str, str],
         rtype, ri = _rrule_to_repeat(rrule, dtstart)
         appt.repeat_type = rtype
         appt.repeat = ri
+        if ri is not None:
+            for ex in props.get('EXDATE', '').split(','):
+                ex_dt = _ics_parse_dt(ex) if ex.strip() else None
+                if ex_dt:
+                    _add_deleted_date(ri, ex_dt)
     else:
         appt.repeat_type = REPEAT_NONE
 
