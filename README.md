@@ -58,8 +58,8 @@ python3 appt_out.py -x <入力ADB> [オプション] [--ics <ICS>] [-i <CSV>] [-
 | オプション | 説明 |
 |-----------|------|
 | `-x FILE` | 入力 ADB ファイル **(必須)** |
-| `--ics FILE` | 取り込む ICS ファイル (種別自動判定・dedup ON・前年以降フィルタがデフォルト) |
-| `--ics-from YYMMDD` | ICS 取り込み開始日 (デフォルト: 前年1/1。`0` でフィルタなし) |
+| `--ics FILE` | 取り込む ICS ファイル (種別自動判定・dedup ON・前年同月1日以降フィルタがデフォルト) |
+| `--ics-from FROM` | ICS 取り込み開始日。`prev-month`=前年同月1日 (デフォルト) / `prev-year`=前年1/1 / `this-year`=今年1/1 / `YYMMDD`・`YYYYMMDD`=日付指定 / `0`=フィルタなし |
 | `-i FILE` | 取り込む CSV ファイル (要 `-a`/`-e`/`-t`) |
 | `-o FILE` | 出力 ADB ファイル |
 | `-a [N]` | Appointment を対象にする (N: 0=無効 1=全て 2=非繰り返しのみ 3=繰り返しのみ) |
@@ -110,8 +110,12 @@ python3 appt_out.py -x APPT.adb -o APPT_backup.adb
 ### ICS → ADB インポート (Google Calendar の予定を追加)
 
 ```bash
-# 基本: 終日イベント→Event, 時間付き→Appointment で自動判定。前年1/1以降のみ取り込み。重複スキップON。
+# 基本: 終日イベント→Event, 時間付き→Appointment で自動判定。前年同月1日以降のみ取り込み。重複スキップON。
 python3 appt_out.py -x APPT.adb --ics basic.ics -o new.adb
+
+# 前年1/1以降 / 今年1/1以降を取り込み
+python3 appt_out.py -x APPT.adb --ics basic.ics -o new.adb --ics-from prev-year
+python3 appt_out.py -x APPT.adb --ics basic.ics -o new.adb --ics-from this-year
 
 # フィルタなし (全期間取り込み)
 python3 appt_out.py -x APPT.adb --ics basic.ics -o new.adb --ics-from 0
@@ -146,8 +150,13 @@ python3 appt_out.py -x APPT.adb -i input.csv -o new.adb -a --dedup
 | 項目 | デフォルト動作 | 変更方法 |
 |------|--------------|---------|
 | 種別判定 | DTSTART に時刻あり→Appointment、終日→Event | (変更不可、自動) |
-| 日付フィルタ | 前年 1/1 より前は除外 | `--ics-from YYMMDD` または `--ics-from 0` |
+| 日付フィルタ | 前年同月 1 日より前は除外 | `--ics-from prev-year` / `this-year` / `YYMMDD` / `0` |
+| 日付フィルタ (繰り返し予定) | 繰り返し終了日がフィルタ日より前なら除外。開始日が古くても、フィルタ日以降に発生する繰り返しは取り込む | (同上) |
 | 重複スキップ | ON (既存ADBと件名・日付・時刻が一致する予定はスキップ) | `--no-dedup` で無効化 |
+
+> ADB が大きいと実機の動作が遅くなり、電池切れ時などにデータが壊れるリスクも高まります。
+> デフォルトは前年同月 1 日から (例: 2026/10 実行時は 2025/10/01 以降) です。
+> `this-year` でも、昨年以前に登録した繰り返し予定のうち今年以降も続くものは取り込まれます。
 
 ### ICS の各プロパティの扱い
 

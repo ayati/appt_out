@@ -7,7 +7,8 @@ Usage:
   python appt_out.py -x APPT.adb                              # ADB→CSV (stdout)
   python appt_out.py -x APPT.adb -a -b                        # ADB→TSV (タブ区切り)
   python appt_out.py -x APPT.adb -o OUT.adb                   # ADB複製
-  python appt_out.py -x APPT.adb --ics IN.ics -o OUT.adb      # ICS→ADB (種別自動判定)
+  python appt_out.py -x APPT.adb --ics IN.ics -o OUT.adb      # ICS→ADB (種別自動判定, 前年同月1日以降)
+  python appt_out.py -x APPT.adb --ics IN.ics -o OUT.adb --ics-from this-year  # 今年1/1以降
   python appt_out.py -x APPT.adb -i IN.csv -o OUT.adb -a      # CSV→ADB追加
 """
 
@@ -1232,6 +1233,21 @@ def _rrule_to_repeat(rrule: str, dtstart: Optional[datetime]) -> Tuple[int, Opti
     return repeat_type, ri if repeat_type != REPEAT_NONE else None
 
 
+def _before_date_from(appt: Appointment, date_from: int) -> bool:
+    """ICS 取り込みの日付フィルタ: date_from (yyyymmdd) より前の予定なら True。
+
+    繰り返し予定は開始日ではなく繰り返し終了日で判定する。
+    開始が date_from より前でも、date_from 以降に発生する繰り返しは取り込む。
+    """
+    if date_from <= 0 or not appt.has_date:
+        return False
+    if appt.repeat is not None:
+        ri = appt.repeat
+        end = (ri.end_year + 1900) * 10000 + (ri.end_month + 1) * 100 + (ri.end_day + 1)
+        return end < date_from
+    return appt.start_date_int < date_from
+
+
 def _add_deleted_date(ri: RepeatInfo, dt: datetime):
     """繰り返しの削除済み発生日リストに日付を追加する。
 
@@ -1308,7 +1324,7 @@ def import_ics(path: str, alarm: int = 7, date_from: int = 0,
                     overrides.append((props, appt))
                     continue
                 # 日付フィルタ: date_from より前のイベントは除外
-                if date_from > 0 and appt.has_date and appt.start_date_int < date_from:
+                if _before_date_from(appt, date_from):
                     continue
                 uid = props.get('UID', '').strip()
                 if appt.repeat is not None and uid:
@@ -1346,7 +1362,7 @@ def import_ics(path: str, alarm: int = 7, date_from: int = 0,
         if parent is not None and rid is not None:
             # 親の元の発生日を削除済みにし、変更回は単独の予定として登録
             _add_deleted_date(parent.repeat, rid)
-        if date_from > 0 and oappt.has_date and oappt.start_date_int < date_from:
+        if _before_date_from(oappt, date_from):
             continue
         results.append(oappt)
 
@@ -1504,8 +1520,10 @@ def main():
     # 入力: ICS と CSV は専用オプションで分離
     parser.add_argument('--ics', dest='input_ics', metavar='FILE',
                         help='取り込む ICS ファイル (終日→Event, 時間あり→Appointment 自動判定)')
-    parser.add_argument('--ics-from', dest='ics_from', metavar='YYMMDD', default=None,
-                        help='ICS 取り込み開始日 (デフォルト: 前年1/1。0=フィルタなし)')
+    parser.add_argument('--ics-from', dest='ics_from', metavar='FROM', default='prev-month',
+                        help='ICS 取り込み開始日: prev-month=前年同月1日 (デフォルト), '
+                             'prev-year=前年1/1, this-year=今年1/1, YYMMDD/YYYYMMDD=日付指定, '
+                             '0=フィルタなし。繰り返し予定は終了日で判定')
     parser.add_argument('-i', dest='input_csv', metavar='FILE',
                         help='取り込む CSV ファイル (要 -a/-e/-t)')
 
@@ -1577,12 +1595,22 @@ def main():
     date_start = _parse_yymmdd(args.date_start) if args.date_start else 19000101
     date_end   = _parse_yymmdd(args.date_end)   if args.date_end   else 22000101
 
-    # ICS 取り込み開始日: デフォルト = 前年 1/1
-    if args.ics_from is not None:
-        ics_from_val = _parse_yymmdd(args.ics_from) if args.ics_from != '0' else 0
+    # ICS 取り込み開始日: デフォルト = 前年同月 1 日
+    today = _date.today()
+    ics_from_presets = {
+        'prev-month': (today.year - 1) * 10000 + today.month * 100 + 1,  # 前年同月 1 日
+        'prev-year':  (today.year - 1) * 10000 + 101,                     # 前年 1/1
+        'this-year':  today.year * 10000 + 101,                           # 今年 1/1
+    }
+    if args.ics_from in ics_from_presets:
+        ics_from_val = ics_from_presets[args.ics_from]
+    elif args.ics_from == '0':
+        ics_from_val = 0
+    elif args.ics_from.isdigit() and len(args.ics_from) in (6, 8):
+        ics_from_val = _parse_yymmdd(args.ics_from)
     else:
-        last_year = _date.today().year - 1
-        ics_from_val = last_year * 10000 + 101  # 前年 1/1
+        parser.error(f'--ics-from: 不正な値です: {args.ics_from} '
+                     f'(prev-month / prev-year / this-year / YYMMDD / YYYYMMDD / 0)')
 
     # ADB読み込み
     if silent < 2:
